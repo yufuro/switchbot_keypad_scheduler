@@ -286,9 +286,22 @@ function fmt(iso){
   const d = new Date(iso), p = (n) => String(n).padStart(2,"0");
   return `${p(d.getMonth()+1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
-function activeIssuance(ruleId){
-  return (state.issuances || []).find(
-    (i) => i.rule_id === ruleId && ["creating","active"].includes(i.state));
+/* 端末にいま載っている発行を探す。パネルや手動で同じ番号が出ている場合も拾う */
+function liveIssuance(rule){
+  const live = (state.issuances || []).filter(
+    (i) => ["creating","active","deleting"].includes(i.state));
+  return live.find((i) => i.rule_id === rule.id)
+      || live.find((i) => i.passcode === rule.passcode)
+      || null;
+}
+function issuanceBadge(rule){
+  const iss = liveIssuance(rule);
+  if(!iss) return "";
+  const label = iss.state === "creating" ? "登録中"
+              : iss.state === "deleting" ? "解除中" : "端末に登録済";
+  const cls = iss.state === "active" ? "live" : "pending";
+  const src = iss.rule_id === rule.id ? "" : "（パネル/手動）";
+  return `<span class="pill ${cls}">${label}${src}</span>`;
 }
 
 function renderCards(){
@@ -300,7 +313,6 @@ function renderCards(){
   }
   box.innerHTML = state.rules.map((r) => {
     const [cls,text] = statusOf(r);
-    const iss = activeIssuance(r.id);
     const repeat = r.repeat_type === "daily" ? "毎日"
       : r.repeat_type === "weekly" ? "毎週 " + r.weekdays_label : r.on_date;
     const days = r.repeat_type === "weekly"
@@ -313,9 +325,7 @@ function renderCards(){
           ? `削除予定 ${fmt(r.next_run.at)}`
           : `次の登録 ${fmt(r.next_run.at)}（有効 ${fmt(r.next_run.start)} 〜 ${fmt(r.next_run.end)}）`)
       : "予定なし";
-    const live = iss
-      ? `<span class="pill live">端末に登録済${iss.state === "creating" ? "（確認中）" : ""}</span>`
-      : "";
+    const live = issuanceBadge(r);
     const panelBadge = r.panel ? `<span class="pill pending">操作パネル ${r.panel_minutes}分</span>` : "";
     return `<article class="card ${r.enabled ? "" : "off"}">
       <div class="top">
