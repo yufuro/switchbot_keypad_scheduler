@@ -199,7 +199,7 @@ class Engine:
                     break
             if end is None:                      # 今日以降に窓がない → 1時間だけ有効
                 end = now + timedelta(hours=1)
-        end, clamped_by = self._clamp_to_schedule(rule["passcode"], now, end)
+        end, clamped_by = self._align_to_schedule(rule["passcode"], now, end)
         with self.lock:
             result = self._create(
                 rule=None,
@@ -211,11 +211,12 @@ class Engine:
                 label=rule["label"],
             )
             result["clamped_by"] = clamped_by
+            result["aligned_until"] = end.strftime("%H:%M")
             return result
 
     def issue_adhoc(self, label: str, passcode: str, minutes: int) -> dict[str, Any]:
         now = self.now()
-        end, clamped_by = self._clamp_to_schedule(
+        end, clamped_by = self._align_to_schedule(
             passcode, now, now + timedelta(minutes=int(minutes))
         )
         with self.lock:
@@ -229,6 +230,7 @@ class Engine:
                 label=label or "manual",
             )
             result["clamped_by"] = clamped_by
+            result["aligned_until"] = end.strftime("%H:%M")
             return result
 
     # ------------------------------------------------------------------- 削除
@@ -342,11 +344,18 @@ class Engine:
                     best = (end, rule)
         return best
 
-    def _clamp_to_schedule(
+    def _align_to_schedule(
         self, passcode: str, now: datetime, end: datetime
     ) -> tuple[datetime, str]:
+        """手で出した番号の終了時刻を、スケジュールの終了時刻にそろえる.
+
+        短縮だけでなく延長もします。パネルの持ち時間が先に切れると、スケジュールの
+        時間帯の途中で番号がいったん消えてしまい（削除と再登録に各1分ほどかかるため）
+        数分間ドアが開かなくなるためです。そろえる先はスケジュールが決めた終了時刻なので、
+        スケジュールが許していない時間まで延びることはありません。
+        """
         limit = self.scheduled_end_limit(passcode, now, end)
-        if limit and limit[0] < end:
+        if limit:
             return limit[0], str(limit[1]["label"])
         return end, ""
 
@@ -389,14 +398,14 @@ class Engine:
                 return {"busy": True}          # 解除の反映待ち。いま作ると端末が拒否する
 
             now = self.now()
-            end, clamped_by = self._clamp_to_schedule(
-                rule["passcode"], now, now + timedelta(minutes=minutes)
-            )
+            wanted = now + timedelta(minutes=minutes)
+            end, clamped_by = self._align_to_schedule(rule["passcode"], now, wanted)
             if clamped_by:
+                direction = "短縮" if end < wanted else "延長"
                 store.log(
                     "INFO",
-                    f"操作パネル: 有効化 {rule['label']} / "
-                    f"スケジュール「{clamped_by}」の終了 {end.strftime('%H:%M')} までに短縮",
+                    f"操作パネル: 有効化 {rule['label']} / スケジュール「{clamped_by}」の終了 "
+                    f"{end.strftime('%H:%M')} にあわせて{direction}",
                 )
             else:
                 store.log("INFO", f"操作パネル: 有効化 {rule['label']} / {minutes}分")
@@ -410,6 +419,7 @@ class Engine:
                 label=rule["label"],
             )
             result["clamped_by"] = clamped_by
+            result["aligned_until"] = end.strftime("%H:%M")
             result["valid_to"] = int(end.timestamp())
             return result
 

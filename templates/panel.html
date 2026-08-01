@@ -243,7 +243,7 @@ async function send(path, kind, btn){
     if(!data.busy) play(kind);
     status = Object.assign(status || {}, data);
     note = data.clamped_by
-      ? `スケジュール「${data.clamped_by}」の終了時刻で切れます。`
+      ? `スケジュール「${data.clamped_by}」にあわせて ${data.aligned_until} まで有効です。`
       : (data.already ? "すでにスケジュールで有効になっています。" : "");
     if(data.busy){
       note = "";

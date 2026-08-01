@@ -456,7 +456,7 @@ $("adhocBtn").addEventListener("click", async () => {
     const res = await api("/api/issue-adhoc", {method:"POST", body: JSON.stringify({
       label:"manual", passcode: $("adhocCode").value.trim(), minutes: Number($("adhocMinutes").value)})});
     notify("発行を依頼しました。認証パッドに反映されるまで1分ほどかかります。"
-      + (res.clamped_by ? `（スケジュール「${res.clamped_by}」の終了時刻で切れます）` : ""), true);
+      + (res.clamped_by ? `（スケジュール「${res.clamped_by}」にあわせて ${res.aligned_until} まで）` : ""), true);
     $("adhocCode").value = "";
     await load(true);
   }catch(e){ notify(e.message, false); }
@@ -480,7 +480,7 @@ document.addEventListener("click", async (ev) => {
       case "issue": {
         const res = await api(`/api/rules/${id}/issue-now`, {method:"POST", body:"{}"});
         notify("発行を依頼しました。反映まで1分ほどかかります。"
-          + (res.clamped_by ? `（スケジュール「${res.clamped_by}」の終了時刻で切れます）` : ""), true);
+          + (res.clamped_by ? `（スケジュール「${res.clamped_by}」にあわせて ${res.aligned_until} まで）` : ""), true);
         break;
       }
       case "revoke": {

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
-DB_PATH = Path(__file__).with_name("data.sqlite3")
+# 既定は app.py と同じフォルダ。APP_DB_PATH で別の場所を指定できます
+DB_PATH = Path(os.getenv("APP_DB_PATH") or Path(__file__).with_name("data.sqlite3")).expanduser()
 _lock = threading.Lock()
 
 SCHEMA = """
@@ -60,10 +62,20 @@ CREATE TABLE IF NOT EXISTS logs (
 
 
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+    except sqlite3.OperationalError as exc:
+        folder = Path(DB_PATH).parent
+        raise sqlite3.OperationalError(
+            f"データベースを開けません: {DB_PATH}（{exc}）\n"
+            f"  ・フォルダは存在しますか: {folder} → {'あり' if folder.is_dir() else 'ありません'}\n"
+            "  ・アプリの起動中にフォルダを移動・リネームしていませんか\n"
+            "  ・data.sqlite3 の所有者が今のユーザーか確認してください（sudo で起動した名残など）\n"
+            "  ・別の場所に置きたい場合は .env に APP_DB_PATH=/絶対パス/data.sqlite3 を設定してください"
+        ) from exc
 
 
 # 後から増えた列（既存の data.sqlite3 をそのまま使えるようにする）
@@ -74,6 +86,14 @@ _ADDED_COLUMNS = (
 
 
 def init() -> None:
+    folder = Path(DB_PATH).parent
+    folder.mkdir(parents=True, exist_ok=True)
+    if not os.access(folder, os.W_OK):
+        raise PermissionError(
+            f"フォルダに書き込めません: {folder}\n"
+            "  SQLite は本体のほかに -wal / -shm ファイルを同じ場所に作ります。"
+            "書き込み権限のある場所に置くか、.env の APP_DB_PATH で別の場所を指定してください。"
+        )
     with _lock, connect() as conn:
         conn.executescript(SCHEMA)
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(rules)")}
@@ -189,8 +209,11 @@ def update_issuance(issuance_id: int, **fields: Any) -> None:
 
 # ----------------------------------------------------------------------- logs
 def log(level: str, message: str) -> None:
-    execute("INSERT INTO logs (ts, level, message) VALUES (?,?,?)", (_now(), level, message))
-    print(f"[{level}] {message}", flush=True)
+    print(f"[{level}] {message}", flush=True)      # 画面ログは DB が壊れていても残す
+    try:
+        execute("INSERT INTO logs (ts, level, message) VALUES (?,?,?)", (_now(), level, message))
+    except sqlite3.Error as exc:
+        print(f"[ERROR] ログを保存できませんでした: {exc}", flush=True)
 
 
 def recent_logs(limit: int = 120) -> list[dict[str, Any]]:
