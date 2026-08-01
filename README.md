@@ -1,0 +1,2 @@
+# switchbot_keypad_scheduler
+パスコードの有効無効を時間管理する
