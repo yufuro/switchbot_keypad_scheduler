@@ -234,6 +234,7 @@ setInterval(tickClock, 1000);
 // ---------------------------------------------------------------- 通信
 async function api(path, options){
   const res = await fetch(path, Object.assign({headers:{"Content-Type":"application/json"}}, options));
+  if(res.status === 401){ location.href = "/login?next=" + encodeURIComponent(location.pathname); return; }
   const data = await res.json().catch(() => ({ok:false, error:"応答を解釈できませんでした"}));
   if(!data.ok) throw new Error(data.error || `エラー (${res.status})`);
   return data;
@@ -249,6 +250,7 @@ function escapeHtml(s){
 
 async function load(refresh){
   const data = await api("/api/state" + (refresh ? "?refresh=1" : ""));
+  if(!data) return;
   state = data;
   serverSkew = new Date(data.now).getTime() - Date.now();
   tickClock();

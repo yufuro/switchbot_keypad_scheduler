@@ -220,6 +220,7 @@ setInterval(() => { if(status && status.on && status.valid_to) render(); }, 1000
 async function poll(){
   try{
     const res = await fetch("/api/panel");
+    if(res.status === 401){ location.href = "/login?next=/panel"; return; }
     const data = await res.json();
     if(data.ok){ status = data; render(); }
   }catch(e){ /* 次の周期で取り直す */ }
@@ -236,6 +237,7 @@ async function send(path, kind, btn){
   $("sub").textContent = "送信しています…";
   try{
     const res = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    if(res.status === 401){ location.href = "/login?next=/panel"; return; }
     const data = await res.json();
     if(!data.ok) throw new Error(data.error || "失敗しました");
     if(!data.busy) play(kind);

@@ -5,15 +5,22 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
+import secrets
+import socket
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request
+from flask import (Flask, jsonify, redirect, render_template, render_template_string,
+                   request, session, url_for)
+
+import time
 
 import store
 from scheduler_core import Engine, rules_overlap, weekdays_label
@@ -25,16 +32,96 @@ TOKEN = os.getenv("SWITCHBOT_TOKEN", "")
 SECRET = os.getenv("SWITCHBOT_SECRET", "")
 DEVICE_ID = os.getenv("SWITCHBOT_DEVICE_ID", "")
 TZ = ZoneInfo(os.getenv("APP_TZ", "Asia/Tokyo"))
-HOST = os.getenv("APP_HOST", "127.0.0.1")
+HOST = os.getenv("APP_HOST", "127.0.0.1")      # LAN から使うなら 0.0.0.0
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")   # 空ならログインなし（loopback専用にすること）
+ALLOW_REMOTE = os.getenv("ALLOW_REMOTE", "0") == "1"
 PORT = int(os.getenv("APP_PORT", "5058"))
 TICK_SECONDS = int(os.getenv("TICK_SECONDS", "30"))
 
 app = Flask(__name__)
+
+# セッション用の鍵。再起動してもログインを維持するためファイルに保存する
+_SECRET_FILE = Path(__file__).with_name("secret.key")
+if not _SECRET_FILE.exists():
+    _SECRET_FILE.write_bytes(secrets.token_bytes(32))
+    _SECRET_FILE.chmod(0o600)
+app.secret_key = _SECRET_FILE.read_bytes()
+app.permanent_session_lifetime = timedelta(days=60)
+
 store.init()
 client = SwitchBotClient(TOKEN, SECRET)
 engine = Engine(client, DEVICE_ID, TZ)
 
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+# ------------------------------------------------------- アクセス制限とログイン
+def is_local_address(addr: str) -> bool:
+    """同じ家・同じ事務所のネットワークからのアクセスか."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local
+
+
+LOGIN_HTML = """<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>ログイン</title>
+<style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#1B1F24;color:#F4F6F8;
+ font-family:-apple-system,"Hiragino Kaku Gothic ProN","Yu Gothic","Noto Sans JP",sans-serif}
+form{width:min(360px,88vw);background:#23272D;border:1px solid #333A42;border-radius:12px;padding:26px}
+h1{margin:0 0 6px;font-size:17px}p{margin:0 0 18px;color:#98A2AD;font-size:13px}
+input{width:100%;box-sizing:border-box;font-size:17px;padding:11px 12px;border-radius:8px;
+ border:1px solid #3A424B;background:#171A1F;color:#F4F6F8}
+button{width:100%;margin-top:14px;font-size:16px;padding:12px;border:none;border-radius:8px;
+ background:#146B4E;color:#fff;font-family:inherit;cursor:pointer}
+.err{color:#F08A80;font-size:13px;margin-top:12px}
+</style></head><body>
+<form method="post">
+  <h1>認証パッド 時間管理</h1>
+  <p>この画面はドアの暗証番号を作れます。合言葉を入れてください。</p>
+  <input type="password" name="password" autofocus autocomplete="current-password"
+         inputmode="text" placeholder="合言葉">
+  <button type="submit">開く</button>
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+</form></body></html>"""
+
+
+@app.before_request
+def guard():
+    addr = request.remote_addr or ""
+    if not ALLOW_REMOTE and not is_local_address(addr):
+        store.log("WARN", f"外部からのアクセスを拒否: {addr}")
+        return "このネットワークからは利用できません", 403
+    if not APP_PASSWORD or session.get("auth") or request.endpoint == "login":
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "ログインが必要です", "login": True}), 401
+    return redirect(url_for("login", next=request.full_path))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not APP_PASSWORD:
+        return redirect("/")
+    error = ""
+    if request.method == "POST":
+        if secrets.compare_digest(request.form.get("password", ""), APP_PASSWORD):
+            session.permanent = True
+            session["auth"] = True
+            nxt = request.args.get("next") or "/"
+            return redirect(nxt if nxt.startswith("/") else "/")
+        error = "合言葉が違います。"
+        store.log("WARN", f"ログイン失敗: {request.remote_addr}")
+        time.sleep(1.5)
+    return render_template_string(LOGIN_HTML, error=error)
+
+
+@app.get("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login") if APP_PASSWORD else "/")
 
 
 # --------------------------------------------------------------------- 入力検証
@@ -326,7 +413,31 @@ if __name__ == "__main__":
     if missing:
         raise SystemExit(f".env に {', '.join(missing)} を設定してください")
 
-    store.log("INFO", f"起動しました device={DEVICE_ID} tz={TZ} tick={TICK_SECONDS}s")
+    if HOST not in ("127.0.0.1", "localhost") and not APP_PASSWORD:
+        print(
+            "\n[警告] LAN に公開していますが APP_PASSWORD が空です。"
+            "同じ Wi-Fi の誰でも暗証番号を作れてしまいます。.env に APP_PASSWORD を設定してください。\n",
+            flush=True,
+        )
+
+    addresses = []
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))
+        addresses.append(probe.getsockname()[0])
+        probe.close()
+    except OSError:
+        pass
+    print(f"  管理画面 : http://127.0.0.1:{PORT}/", flush=True)
+    for addr in addresses:
+        print(f"           : http://{addr}:{PORT}/  （同じ Wi-Fi の端末から）", flush=True)
+        print(f"  操作パネル: http://{addr}:{PORT}/panel", flush=True)
+    try:
+        print(f"           : http://{socket.gethostname()}:{PORT}/panel", flush=True)
+    except OSError:
+        pass
+
+    store.log("INFO", f"起動しました device={DEVICE_ID} tz={TZ} tick={TICK_SECONDS}s host={HOST}")
     scheduler = start_scheduler()
     try:
         app.run(host=HOST, port=PORT, debug=False, use_reloader=False, threaded=True)
