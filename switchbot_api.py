@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import random
 import time
 import uuid
 from typing import Any
@@ -27,6 +28,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 HOST = "https://api.switch-bot.com"
 VALID_KEY_TYPES = ("permanent", "timeLimit", "disposable", "urgent")
+NETWORK_RETRIES = 2          # 一時的な回線・DNS の失敗はその場で少しだけ粘る
 
 
 class SwitchBotError(RuntimeError):
@@ -59,12 +61,19 @@ class SwitchBotClient:
 
     def _request(self, method: str, path: str, json_body: dict | None = None) -> dict[str, Any]:
         url = f"{HOST}{path}"
-        try:
-            res = requests.request(
-                method, url, headers=self._headers(), json=json_body, timeout=self.timeout
-            )
-        except requests.RequestException as exc:
-            raise SwitchBotError(f"通信エラー: {exc}") from exc
+        last: Exception | None = None
+        for attempt in range(NETWORK_RETRIES + 1):
+            try:
+                res = requests.request(
+                    method, url, headers=self._headers(), json=json_body, timeout=self.timeout
+                )
+                break
+            except requests.RequestException as exc:
+                last = exc
+                if attempt < NETWORK_RETRIES:
+                    time.sleep(1.5 * (attempt + 1) + random.random())
+        else:
+            raise SwitchBotError(f"通信エラー: {last}") from last
 
         if res.status_code == 401:
             raise SwitchBotError("401 Unauthorized: token / secret が違うか、1日1万回の上限を超えています")

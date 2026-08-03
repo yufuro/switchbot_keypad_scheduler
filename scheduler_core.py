@@ -22,7 +22,9 @@ from switchbot_api import SwitchBotClient, SwitchBotError
 
 CREATE_TIMEOUT = 420      # createKey がこの秒数たっても反映されなければエラー扱い
 DELETE_RETRY = 180        # deleteKey の再送間隔（秒）
+CREATE_RETRY = 180        # 発行に失敗したときの再試行間隔（秒）
 SYNC_INTERVAL = 60        # keyList を取り直す最短間隔（秒）
+PANEL_LOOKAHEAD = 120     # パネル操作時に「直近のスケジュール」とみなす範囲（分）
 WEEKDAY_LABELS = ("月", "火", "水", "木", "金", "土", "日")
 
 
@@ -155,6 +157,10 @@ class Engine:
         label: str,
     ) -> dict[str, Any]:
         key_name = _key_name(rule["id"] if rule else None, occurrence, label, start)
+        base, dup = key_name, 1
+        while store.query("SELECT id FROM issuances WHERE key_name=?", (key_name,)):
+            dup += 1
+            key_name = f"{base}-{dup}"
         valid_from = int(start.timestamp()) if start else None
         valid_to = int(end.timestamp()) if end else None
         issuance_id = store.insert_issuance(
@@ -188,50 +194,91 @@ class Engine:
         self.keys_synced_at = 0.0   # 次の tick で確認しにいく
         return {"issuance_id": issuance_id, "key_name": key_name}
 
-    def issue_now(self, rule: dict, minutes: int | None = None) -> dict[str, Any]:
-        """ルールのパスコードを今すぐ発行する（終了は今日の終了時刻、または指定分後）."""
-        now = self.now()
-        end = now + timedelta(minutes=int(minutes)) if minutes else None
-        if end is None:
-            for _occ, _start, window_end in self.candidate_windows(rule, now):
-                if window_end > now:
-                    end = window_end
-                    break
-            if end is None:                      # 今日以降に窓がない → 1時間だけ有効
-                end = now + timedelta(hours=1)
-        end, clamped_by = self._align_to_schedule(rule["passcode"], now, end)
+    def nearest_window(
+        self, passcode: str, now: datetime, lookahead: int = PANEL_LOOKAHEAD
+    ) -> tuple[dict, str, datetime, datetime] | None:
+        """同じ番号の「いま開いている窓」または「これから lookahead 分以内に始まる窓」."""
+        upper = now + timedelta(minutes=lookahead)
+        best: tuple[dict, str, datetime, datetime] | None = None
+        for rule in store.list_rules():
+            if not rule["enabled"] or rule["passcode"] != passcode:
+                continue
+            for occurrence, start, end in self.candidate_windows(rule, now):
+                if end <= now or start > upper:
+                    continue
+                if best is None or start < best[2]:
+                    best = (rule, occurrence, start, end)
+        return best
+
+    def activate(
+        self, passcode: str, label: str, fallback_minutes: int
+    ) -> dict[str, Any]:
+        """番号を今すぐ有効にする.
+
+        直近（既定2時間以内）に同じ番号のスケジュールがあれば、その回の**開始時刻を
+        前倒しした**ものとして発行します。終了時刻は元のスケジュールのままです。
+        こうすると発行がひとつで済むので、パネルとスケジュールの切り替えで
+        番号が一瞬使えなくなる時間が生まれません。
+        直近のスケジュールがなければ fallback_minutes だけ有効な番号を出します。
+        """
         with self.lock:
-            result = self._create(
-                rule=None,
-                occurrence="",
-                passcode=rule["passcode"],
-                key_type=rule["key_type"] if rule["key_type"] == "permanent" else "timeLimit",
-                start=now - timedelta(minutes=1),
-                end=end,
-                label=rule["label"],
-            )
-            result["clamped_by"] = clamped_by
+            live = [
+                i for i in store.list_issuances(("creating", "active"))
+                if i["passcode"] == passcode
+            ]
+            if live:                            # すでに使える状態なので何もしない
+                head = max(live, key=lambda i: i["valid_to"] or 0)
+                return {"already": True, "key_name": head["key_name"],
+                        "valid_to": head["valid_to"]}
+            if self.passcode_busy(passcode):    # 削除の反映待ち
+                return {"busy": True}
+
+            now = self.now()
+            target = self.nearest_window(passcode, now)
+            if target:
+                owner, occurrence, start, end = target
+                previous = store.find_issuance(owner["id"], occurrence)
+                if previous:                    # 同じ回の古い記録は外して作り直す
+                    store.update_issuance(
+                        previous["id"], occurrence="", detail="パネル操作で発行し直しました"
+                    )
+                result = self._create(
+                    rule=owner,
+                    occurrence=occurrence,
+                    passcode=passcode,
+                    key_type=owner["key_type"],
+                    start=now - timedelta(minutes=1),
+                    end=end,
+                    label=owner["label"],
+                )
+                result["schedule"] = owner["label"]
+                result["scheduled_start"] = start.strftime("%H:%M")
+                result["started_early"] = start > now
+            else:
+                end = now + timedelta(minutes=int(fallback_minutes))
+                result = self._create(
+                    rule=None,
+                    occurrence="",
+                    passcode=passcode,
+                    key_type="timeLimit",
+                    start=now - timedelta(minutes=1),
+                    end=end,
+                    label=label,
+                )
+                result["schedule"] = ""
+                result["scheduled_start"] = ""
+                result["started_early"] = False
             result["aligned_until"] = end.strftime("%H:%M")
+            result["valid_to"] = int(end.timestamp())
             return result
 
+    def issue_now(self, rule: dict, minutes: int | None = None) -> dict[str, Any]:
+        """管理画面の「今すぐ発行」。パネルと同じ扱いにする."""
+        fallback = int(minutes or rule["panel_minutes"] or 120)
+        return self.activate(rule["passcode"], rule["label"], fallback)
+
     def issue_adhoc(self, label: str, passcode: str, minutes: int) -> dict[str, Any]:
-        now = self.now()
-        end, clamped_by = self._align_to_schedule(
-            passcode, now, now + timedelta(minutes=int(minutes))
-        )
-        with self.lock:
-            result = self._create(
-                rule=None,
-                occurrence="",
-                passcode=passcode,
-                key_type="timeLimit",
-                start=now - timedelta(minutes=1),
-                end=end,
-                label=label or "manual",
-            )
-            result["clamped_by"] = clamped_by
-            result["aligned_until"] = end.strftime("%H:%M")
-            return result
+        return self.activate(passcode, label or "manual", int(minutes))
 
     # ------------------------------------------------------------------- 削除
     def _delete_issuance(self, iss: dict, reason: str, retry: bool = False) -> bool:
@@ -264,7 +311,9 @@ class Engine:
         self.keys_synced_at = 0.0
         return True
 
-    def sweep_same_passcode(self, passcode: str, exclude_id: int | None, reason: str) -> int:
+    def sweep_same_passcode(
+        self, passcode: str, exclude_id: int | None, reason: str, reissue: bool = True
+    ) -> int:
         """同じ番号で有効になっている発行を、まとめて削除する.
 
         別のルールや操作パネルから同じ番号が登録されていると、片方だけ消しても
@@ -280,7 +329,7 @@ class Engine:
                 continue
             count += 1
             store.log("INFO", f"同じ番号 {passcode} を同時に削除: {other['key_name']}")
-            if other["rule_id"] and other["valid_to"] and other["valid_to"] > now_ts:
+            if reissue and other["rule_id"] and other["valid_to"] and other["valid_to"] > now_ts:
                 # 時間帯がまだ残っているので、あとで登録し直せるようにしておく
                 store.update_issuance(
                     other["id"], occurrence="", detail=f"{reason}（時間帯が残るため再登録します）"
@@ -295,8 +344,9 @@ class Engine:
         return False
 
     def revoke_passcode_now(self, passcode: str, reason: str = "手動で無効化") -> int:
+        """手で無効にしたものは、その回のスケジュールが残っていても復活させない."""
         with self.lock:
-            return self.sweep_same_passcode(passcode, None, reason)
+            return self.sweep_same_passcode(passcode, None, reason, reissue=False)
 
     def revoke_rule_now(self, rule_id: int) -> int:
         """このルールの番号で有効になっているものを、発行元を問わずすべて消す."""
@@ -307,7 +357,9 @@ class Engine:
                 if iss["rule_id"] == rule_id and self._delete_issuance(iss, "手動で無効化"):
                     count += 1
             if rule.get("passcode"):
-                count += self.sweep_same_passcode(rule["passcode"], None, "手動で無効化")
+                count += self.sweep_same_passcode(
+                    rule["passcode"], None, "手動で無効化", reissue=False
+                )
             return count
 
     def revoke_issuance(self, issuance_id: int) -> bool:
@@ -324,41 +376,6 @@ class Engine:
             self.keys_synced_at = 0.0
 
     # ------------------------------------------------------------- 操作パネル
-    def scheduled_end_limit(
-        self, passcode: str, now: datetime, upper: datetime
-    ) -> tuple[datetime, dict] | None:
-        """now〜upper の間に来る「スケジュールによる無効化」のうち、いちばん早いもの.
-
-        パネルから手で有効化しても、スケジュールが決めた終了時刻より先には延ばしません。
-        """
-        best: tuple[datetime, dict] | None = None
-        for rule in store.list_rules():
-            if not rule["enabled"] or rule["passcode"] != passcode:
-                continue
-            for _occ, start, end in self.candidate_windows(rule, now):
-                if end <= now:
-                    continue
-                if start > upper:          # パネルの有効時間より後に始まる窓は関係ない
-                    continue
-                if best is None or end < best[0]:
-                    best = (end, rule)
-        return best
-
-    def _align_to_schedule(
-        self, passcode: str, now: datetime, end: datetime
-    ) -> tuple[datetime, str]:
-        """手で出した番号の終了時刻を、スケジュールの終了時刻にそろえる.
-
-        短縮だけでなく延長もします。パネルの持ち時間が先に切れると、スケジュールの
-        時間帯の途中で番号がいったん消えてしまい（削除と再登録に各1分ほどかかるため）
-        数分間ドアが開かなくなるためです。そろえる先はスケジュールが決めた終了時刻なので、
-        スケジュールが許していない時間まで延びることはありません。
-        """
-        limit = self.scheduled_end_limit(passcode, now, end)
-        if limit:
-            return limit[0], str(limit[1]["label"])
-        return end, ""
-
     def panel_status(self, rule: dict | None) -> dict[str, Any]:
         """操作パネル用の状態。番号単位で見るので、どこから発行されたかは問いません."""
         if not rule:
@@ -384,44 +401,28 @@ class Engine:
         }
 
     def panel_on(self, rule: dict) -> dict[str, Any]:
-        minutes = int(rule["panel_minutes"] or 120)
-        with self.lock:
-            existing = [
-                i for i in store.list_issuances(("creating", "active"))
-                if i["passcode"] == rule["passcode"]
-            ]
-            if existing:                       # 二重登録は端末が拒否するので作らない
-                head = max(existing, key=lambda i: i["valid_to"] or 0)
-                return {"already": True, "key_name": head["key_name"],
-                        "valid_to": head["valid_to"]}
-            if self.passcode_busy(rule["passcode"]):
-                return {"busy": True}          # 解除の反映待ち。いま作ると端末が拒否する
-
-            now = self.now()
-            wanted = now + timedelta(minutes=minutes)
-            end, clamped_by = self._align_to_schedule(rule["passcode"], now, wanted)
-            if clamped_by:
-                direction = "短縮" if end < wanted else "延長"
-                store.log(
-                    "INFO",
-                    f"操作パネル: 有効化 {rule['label']} / スケジュール「{clamped_by}」の終了 "
-                    f"{end.strftime('%H:%M')} にあわせて{direction}",
-                )
-            else:
-                store.log("INFO", f"操作パネル: 有効化 {rule['label']} / {minutes}分")
-            result = self._create(
-                rule=None,
-                occurrence="",
-                passcode=rule["passcode"],
-                key_type="timeLimit",
-                start=now - timedelta(minutes=1),
-                end=end,
-                label=rule["label"],
+        result = self.activate(
+            rule["passcode"], rule["label"], int(rule["panel_minutes"] or 120)
+        )
+        if result.get("already"):
+            store.log("INFO", f"操作パネル: {rule['label']} はすでに有効")
+        elif result.get("busy"):
+            store.log("INFO", f"操作パネル: {rule['label']} は解除の反映待ち")
+        elif result.get("schedule"):
+            how = "前倒しで開始" if result.get("started_early") else "開始"
+            store.log(
+                "INFO",
+                f"操作パネル: スケジュール「{result['schedule']}」"
+                f"（本来 {result['scheduled_start']} 開始）を{how} / "
+                f"終了は予定どおり {result['aligned_until']}",
             )
-            result["clamped_by"] = clamped_by
-            result["aligned_until"] = end.strftime("%H:%M")
-            result["valid_to"] = int(end.timestamp())
-            return result
+        else:
+            store.log(
+                "INFO",
+                f"操作パネル: 有効化 {rule['label']} / "
+                f"直近のスケジュールなし → {result['aligned_until']} まで",
+            )
+        return result
 
     def panel_off(self, rule: dict) -> int:
         store.log("INFO", f"操作パネル: 無効化 {rule['label']}")
@@ -441,8 +442,18 @@ class Engine:
                 for occurrence, start, end in self.candidate_windows(rule, now):
                     if not (start - lead <= now < end):
                         continue
-                    if store.find_issuance(rule["id"], occurrence):
-                        continue
+                    existing = store.find_issuance(rule["id"], occurrence)
+                    if existing:
+                        # 回線が切れていたなどで失敗した回は、時間帯が残っていれば作り直す
+                        stale = int(time.time()) - existing["updated_at"] > CREATE_RETRY
+                        if existing["state"] == "error" and stale:
+                            store.update_issuance(
+                                existing["id"], occurrence="",
+                                detail=f"{existing['detail']} / 再試行しました",
+                            )
+                            store.log("INFO", f"発行を再試行します: {rule['label']}")
+                        else:
+                            continue
                     if self.passcode_busy(rule["passcode"]):
                         continue          # 同じ番号が端末に残っている間は登録しない
                     try:

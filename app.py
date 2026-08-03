@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import os
 import re
 import secrets
+import shutil
 import socket
+import subprocess
 import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,11 +21,12 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from flask import (Flask, jsonify, redirect, render_template, render_template_string,
-                   request, session, url_for)
+                   request, send_from_directory, session, url_for)
 
 import time
 
 import store
+from phrases import PHRASES
 from scheduler_core import Engine, rules_overlap, weekdays_label
 from switchbot_api import SwitchBotClient, SwitchBotError
 
@@ -38,6 +42,13 @@ ALLOW_REMOTE = os.getenv("ALLOW_REMOTE", "0") == "1"
 PORT = int(os.getenv("APP_PORT", "5058"))
 TICK_SECONDS = int(os.getenv("TICK_SECONDS", "30"))
 
+# macOS の say コマンドで作る読み上げ音声（声の一覧は `say -v "?"` で確認できます）
+VOICE_NAME = os.getenv("APP_VOICE", "Kyoko")
+VOICE_RATE = os.getenv("APP_VOICE_RATE", "175")
+AUDIO_DIR = Path(__file__).with_name("audio")
+CUSTOM_DIR = AUDIO_DIR / "custom"      # 自分で用意した音声ファイルを置く場所
+AUDIO_EXTS = (".m4a", ".mp3", ".wav", ".aac", ".ogg", ".opus", ".aiff")
+
 app = Flask(__name__)
 
 # セッション用の鍵。再起動してもログインを維持するためファイルに保存する
@@ -49,6 +60,114 @@ app.secret_key = _SECRET_FILE.read_bytes()
 app.permanent_session_lifetime = timedelta(days=60)
 
 store.init()
+
+
+def available_japanese_voices() -> str:
+    """say が使える日本語の声を一覧にする（エラー案内用）."""
+    try:
+        out = subprocess.run(["say", "-v", "?"], capture_output=True, timeout=10, check=True)
+        names = [
+            line.split("  ")[0].strip()
+            for line in out.stdout.decode(errors="ignore").splitlines()
+            if "ja_JP" in line
+        ]
+        return " / ".join(names)
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def custom_voice_files() -> tuple[dict[str, str], list[str]]:
+    """audio/custom/ に置かれた音声ファイル（Google TTS などで作ったもの）を拾う.
+
+    大文字小文字は区別しません。使われなかったファイルは理由付きで返します。
+    """
+    files: dict[str, str] = {}
+    ignored: list[str] = []
+    if not CUSTOM_DIR.is_dir():
+        return files, ignored
+    for path in sorted(CUSTOM_DIR.iterdir()):
+        if not path.is_file() or path.name.startswith(("._", ".")):
+            continue
+        key, suffix = path.stem.lower(), path.suffix.lower()
+        if key not in PHRASES:
+            ignored.append(f"{path.name}（ファイル名が違います）")
+            continue
+        if suffix not in AUDIO_EXTS:
+            ignored.append(f"{path.name}（対応していない拡張子です）")
+            continue
+        if key in files:
+            ignored.append(f"{path.name}（同じ名前のファイルが複数あります）")
+            continue
+        # 差し替えたらすぐ反映されるように更新時刻を付ける
+        files[key] = f"/audio/custom/{path.name}?v={int(path.stat().st_mtime)}"
+    return files, ignored
+
+
+def say_voice_files() -> dict[str, str]:
+    """say コマンドで読み上げ音声を用意する（macOS 以外では空を返す）."""
+    if not shutil.which("say"):
+        return {}
+    try:
+        AUDIO_DIR.mkdir(exist_ok=True)
+    except OSError:
+        return {}
+    files, wanted = {}, set()
+    for key, text in PHRASES.items():
+        digest = hashlib.md5(f"{VOICE_NAME}|{VOICE_RATE}|{text}".encode()).hexdigest()[:12]
+        name = f"{key}-{digest}.m4a"
+        wanted.add(name)
+        path = AUDIO_DIR / name
+        if not path.exists():
+            try:
+                subprocess.run(
+                    ["say", "-v", VOICE_NAME, "-r", str(VOICE_RATE), "-o", str(path), text],
+                    check=True, capture_output=True, timeout=30,
+                )
+            except (subprocess.SubprocessError, OSError) as exc:
+                detail = getattr(exc, "stderr", b"") or b""
+                print(f"[WARN] 読み上げ音声を作れませんでした（APP_VOICE={VOICE_NAME}）: "
+                      f"{detail.decode(errors='ignore').strip() or exc}", flush=True)
+                print("       使える日本語の声: "
+                      + (available_japanese_voices() or "（見つかりません）"), flush=True)
+                print("       ブラウザ内蔵の読み上げに切り替えます。", flush=True)
+                return {}
+        files[key] = f"/audio/{name}"
+    for stale in AUDIO_DIR.glob("*.m4a"):        # 声や文言を変えたときの掃除
+        if stale.name not in wanted:
+            stale.unlink(missing_ok=True)
+    return files
+
+
+def build_voice_files() -> dict[str, str]:
+    """自作ファイル → say → （足りなければブラウザ内蔵）の順に使う."""
+    try:
+        AUDIO_DIR.mkdir(exist_ok=True)
+        CUSTOM_DIR.mkdir(exist_ok=True)
+    except OSError:
+        pass
+    custom, ignored = custom_voice_files()
+    generated = say_voice_files() if len(custom) < len(PHRASES) else {}
+    merged = {**generated, **custom}          # 自作ファイルを優先
+
+    print(f"  読み上げ音声（{CUSTOM_DIR} に置いたファイルを優先します）", flush=True)
+    for key in PHRASES:
+        if key in custom:
+            source = "自作 " + custom[key].split("/")[-1].split("?")[0]
+        elif key in generated:
+            source = f"say（{VOICE_NAME}）"
+        else:
+            source = "ブラウザ内蔵の読み上げ"
+        print(f"    {key:9} {source}", flush=True)
+    for item in ignored:
+        print(f"    [無視] {item}", flush=True)
+    if ignored:
+        print(f"    使える名前: {', '.join(PHRASES)}"
+              f"  拡張子: {', '.join(AUDIO_EXTS)}", flush=True)
+    return merged
+
+
+VOICE_FILES = build_voice_files()
+
 client = SwitchBotClient(TOKEN, SECRET)
 engine = Engine(client, DEVICE_ID, TZ)
 
@@ -66,7 +185,7 @@ def is_local_address(addr: str) -> bool:
 
 
 LOGIN_HTML = """<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>ログイン</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>久地道場認証パッド時間管理 ログイン</title>
 <style>
 body{margin:0;min-height:100vh;display:grid;place-items:center;background:#1B1F24;color:#F4F6F8;
  font-family:-apple-system,"Hiragino Kaku Gothic ProN","Yu Gothic","Noto Sans JP",sans-serif}
@@ -79,7 +198,7 @@ button{width:100%;margin-top:14px;font-size:16px;padding:12px;border:none;border
 .err{color:#F08A80;font-size:13px;margin-top:12px}
 </style></head><body>
 <form method="post">
-  <h1>認証パッド 時間管理</h1>
+  <h1>久地道場認証パッド時間管理</h1>
   <p>この画面はドアの暗証番号を作れます。合言葉を入れてください。</p>
   <input type="password" name="password" autofocus autocomplete="current-password"
          inputmode="text" placeholder="合言葉">
@@ -345,6 +464,19 @@ def api_delete_key(key_id: int):
     except SwitchBotError as exc:
         return fail(str(exc), 502)
     return jsonify({"ok": True})
+
+
+@app.get("/audio/<path:name>")
+def audio_file(name: str):
+    return send_from_directory(AUDIO_DIR, name, max_age=86400)
+
+
+@app.get("/api/voice")
+def api_voice():
+    res = jsonify({"ok": True, "voice": VOICE_NAME, "files": VOICE_FILES,
+                   "phrases": PHRASES, "custom_dir": str(CUSTOM_DIR)})
+    res.headers["Cache-Control"] = "no-store"   # 差し替えがすぐ反映されるように
+    return res
 
 
 @app.post("/api/tick")

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>認証パッド 時間管理</title>
+<title>久地道場認証パッド時間管理</title>
 <style>
 :root{
   --paper:#EDEFF2; --surface:#FFFFFF; --ink:#171A1F; --muted:#6E7681;
@@ -117,7 +117,7 @@ td.num{font-family:var(--mono);letter-spacing:.08em}
 <body data-device="{{ device_id }}" data-tz="{{ tz }}">
 
 <header>
-  <h1>認証パッド 時間管理</h1>
+  <h1>久地道場認証パッド時間管理</h1>
   <div class="meta">device <span class="mono">{{ device_id }}</span> ／ {{ tz }}</div>
   <a class="meta" href="/panel" target="_blank" rel="noopener"
      style="border:1px solid var(--line);border-radius:6px;padding:4px 10px;text-decoration:none">
@@ -456,7 +456,8 @@ $("adhocBtn").addEventListener("click", async () => {
     const res = await api("/api/issue-adhoc", {method:"POST", body: JSON.stringify({
       label:"manual", passcode: $("adhocCode").value.trim(), minutes: Number($("adhocMinutes").value)})});
     notify("発行を依頼しました。認証パッドに反映されるまで1分ほどかかります。"
-      + (res.clamped_by ? `（スケジュール「${res.clamped_by}」にあわせて ${res.aligned_until} まで）` : ""), true);
+      + (res.schedule ? `（スケジュール「${res.schedule}」として ${res.aligned_until} まで）`
+                    : (res.aligned_until ? `（${res.aligned_until} まで）` : "")), true);
     $("adhocCode").value = "";
     await load(true);
   }catch(e){ notify(e.message, false); }
@@ -480,7 +481,8 @@ document.addEventListener("click", async (ev) => {
       case "issue": {
         const res = await api(`/api/rules/${id}/issue-now`, {method:"POST", body:"{}"});
         notify("発行を依頼しました。反映まで1分ほどかかります。"
-          + (res.clamped_by ? `（スケジュール「${res.clamped_by}」にあわせて ${res.aligned_until} まで）` : ""), true);
+          + (res.schedule ? `（スケジュール「${res.schedule}」として ${res.aligned_until} まで）`
+                    : (res.aligned_until ? `（${res.aligned_until} まで）` : "")), true);
         break;
       }
       case "revoke": {
